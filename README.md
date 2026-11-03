@@ -1,20 +1,18 @@
 # whatsapp-playwright
 
-An async [Playwright](https://playwright.dev/python/) automation class for
-WhatsApp Web, with persistent sessions, send pacing and account-health
-guardrails. Everything lives in `whatsapp_web.py`.
+A small async Python wrapper around WhatsApp Web, built on Playwright. It logs
+in once, keeps the session on disk, and lets you send and read messages from a
+script. The whole thing is one file: `whatsapp_web.py`.
 
-> WhatsApp Web is a private UI that changes without notice, and automating it
-> may violate WhatsApp's Terms of Service. Use it only for your own account and
-> only to message people who expect to hear from you.
-
-## Dependencies
-
-- Python 3.10+ (developed on 3.15)
-- `playwright` 1.45+ (runtime, see `requirements.txt`)
-- `pytest`, `pytest-asyncio`, `pytest-cov` (development, see `requirements-dev.txt`)
+A word of warning before you use it: WhatsApp Web isn't a public API. The page
+changes without notice, and automating it goes against WhatsApp's terms. I use
+it for my own account and for people who expect to hear from me. If you need
+volume or anything business-related, use the
+[WhatsApp Business Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api).
 
 ## Setup
+
+You need Python 3.10 or newer.
 
 ```bash
 python3 -m venv .venv
@@ -23,149 +21,144 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-## First run (scan the QR code)
+If you'd rather use your installed Chrome, skip `playwright install` and pass
+`channel="chrome"` in the config.
 
-The browser profile is stored in a user-data directory (default
-`~/.whatsapp-playwright/session`), so you only scan the QR code once.
+## Logging in the first time
+
+Run it with a visible browser so you can scan the QR code:
 
 ```bash
-# Headed mode is required the first time so you can see the QR code
 python whatsapp_web.py --contact "Some Contact" --message "Hello"
 ```
 
-Then open WhatsApp on your phone: Linked devices > Link a device, and scan.
-Later runs reuse the saved session and can use `--headless`.
+On your phone go to Settings > Linked devices > Link a device and scan the code.
+The session is saved in `~/.whatsapp-playwright/session`, so after that you
+won't see the QR code again and can add `--headless`.
+
+## Using it
 
 ```python
 import asyncio
 from whatsapp_web import WhatsAppWeb, WhatsAppWebConfig
 
 async def main():
-    config = WhatsAppWebConfig(headless=False, user_data_dir="~/.wa-session")
+    config = WhatsAppWebConfig(channel="chrome")
     async with WhatsAppWeb(config) as wa:
         await wa.login()
         await wa.send_message("Some Contact", "Hello!")
-        print(await wa.get_last_messages("Some Contact", limit=5))
+        for message in await wa.get_last_messages("Some Contact", limit=5):
+            print(message.direction, message.text)
 
 asyncio.run(main())
 ```
 
-One client drives one browser page, so every public operation holds an
-internal `asyncio.Lock`: concurrent calls (for example from `asyncio.gather`)
-run one after another, never interleaved. `wait_for_message(contact, timeout_s=60)`
-keeps the client locked while it waits.
+What's there:
 
-Main methods: `login`, `send_message`, `send_message_to_number`,
-`get_last_messages`, `get_unread_chats`, `is_online`, `wait_for_message`,
-`send_file`, `create_group`, `logout`, `close`.
+- `login()`
+- `send_message(name, text)` and `send_message_to_number(number, text)`
+- `send_file(name, path, caption="")`
+- `get_last_messages(name, limit=10)` and `wait_for_message(name, timeout_s=60)`
+- `get_unread_chats()` and `is_online(name)`
+- `create_group(name, participants)`
+- `logout()` and `close()`
 
-All selectors live in the `Selectors` dataclass. If WhatsApp changes its DOM,
-override just the broken fields and pass them in:
-`WhatsAppWeb(config, selectors=dataclasses.replace(Selectors(), send_button=(...,)))`.
+One client drives one browser tab, so calls are queued behind a lock. If you
+`asyncio.gather` two sends, they run one after the other.
+
+Sends are checked: after sending, the client waits for the message to show up
+in the chat and leave the "pending" state. If it never shows up you get
+`MessageSendError`. If it shows up but is still pending when the timeout hits,
+you get `MessageUnconfirmedError`, which means it may well have gone through,
+so look before you retry. Nothing is retried automatically, to avoid double
+sends.
+
+### When WhatsApp changes its page
+
+It will. All the CSS selectors are in the `Selectors` dataclass, each with a
+few fallbacks. When something breaks, fix the one field rather than the code:
+
+```python
+from dataclasses import replace
+from whatsapp_web import Selectors
+
+selectors = replace(Selectors(), send_button=('button[aria-label="Send"]',))
+wa = WhatsAppWeb(config, selectors=selectors)
+```
+
+The selectors were last checked against the live site in November 2026. Some
+of them match English text (the "You:" and "Read" labels on your own messages,
+menu names like "Document"), so a WhatsApp set to another language will need
+overrides.
 
 ## Configuration
 
-`WhatsAppWebConfig` options: `headless`, `user_data_dir`, `channel`
-(for example `"chrome"` to use your installed browser instead of Playwright's
-Chromium), `default_timeout_ms`, `short_timeout_ms`, `login_timeout_s`,
-`send_verify_timeout_s`, `upload_verify_timeout_s`, `poll_interval_s`,
-`retry_attempts`, `retry_delay_s`, plus the nested configs below.
+`WhatsAppWebConfig` takes `headless`, `user_data_dir`, `channel`, a handful of
+timeouts (`default_timeout_ms`, `login_timeout_s`, `send_verify_timeout_s`,
+...), retry settings, and three nested configs for pacing and safety.
 
-### Send pacing
+### Pacing
 
-`RateLimitConfig` (all send paths acquire it before sending):
+`RateLimitConfig` spaces out sends:
 
-| Option | Default | Meaning |
+| Option | Default | |
 | --- | --- | --- |
-| `min_interval_seconds` | 3.0 | Minimum gap between sends |
-| `max_per_minute` | 10 | Sliding 60 s window |
-| `max_per_hour` | 60 | Sliding 1 h window |
-| `max_per_day` | 200 | Sliding 24 h window; always raises `SafetyViolationError` |
-| `on_limit` | `"wait"` | `"wait"` sleeps until allowed, `"raise"` raises `RateLimitExceededError` |
+| `min_interval_seconds` | 3 | gap between two sends |
+| `max_per_minute` | 10 | |
+| `max_per_hour` | 60 | |
+| `max_per_day` | 200 | hitting this raises instead of waiting |
+| `on_limit` | `"wait"` | or `"raise"` to get `RateLimitExceededError` |
 
-`TypingConfig` types messages with `keyboard.type(text, delay=...)`. The
-per-character delay is drawn uniformly from `min_delay_ms`..`max_delay_ms`
-(default 30..80), and `max_total_seconds` (default 10) caps the total typing
-time of a message. Set both delays to 0 to disable (text is inserted instantly).
+`TypingConfig` types messages a character at a time, 30 to 80 ms per character,
+but never for more than 10 seconds per message. Set both delays to 0 to paste
+the text in at once.
 
-### How a send is processed
+### Keeping your account safe
 
-Every send path (`send_message`, `send_message_to_number`, `send_file`,
-`create_group`) goes through the same pipeline: health check (breaker and
-warning banners) and history-independent guard checks, then the rate-limit
-slot (taken BEFORE any chat is opened, so a long wait cannot type into the
-wrong chat), then open the chat and review its history, then all checks again,
-record, deliver, and confirm. A send that is refused after the slot was taken
-still consumes the slot.
+WhatsApp bans accounts mostly for what happens on its side: people blocking or
+reporting you, lots of chats started with strangers, the same text sent to
+everyone. A browser script can't hide that, so there's no "stealth" code here.
+`SafetyConfig` just keeps you from doing those things by accident. It's on by
+default:
 
-Confirmation compares the id of the newest outgoing message. If the message
-never appears you get `MessageSendError`; if it appeared but was still pending
-at the timeout you get `MessageUnconfirmedError` (a subclass), which means it
-**may have been delivered, so do not blindly retry**. The composer is cleared
-(select all + Backspace) before typing so stale drafts are never sent.
+- At most 10 messages a day to people who have never written to you
+  (`max_new_recipients_per_day`). New numbers and group members count.
+- The same text, or the same file, to at most 5 people a day
+  (`max_identical_recipients`). Only hashes are stored, not the messages.
+- At most 2 new groups a day (`max_groups_per_day`).
+- If someone replies "stop" or "unsubscribe" (punctuation and emoji are
+  ignored, so "STOP." works), they're opted out and further sends to them
+  raise `SafetyViolationError`. You can also call `opt_out()`, `opt_in()` and
+  `is_opted_out()` yourself.
+- If WhatsApp logs you out unexpectedly, shows a spam or ban warning, or three
+  sends fail in a row, all sending stops with `AccountAtRiskError` until you
+  look into it and call `reset_safety_breaker()`.
 
-### Avoiding bans
+All of this is saved in `safety_state.json` inside the session folder, so
+restarting the script doesn't reset the counters. If that file gets corrupted,
+it's moved aside and sending stays blocked until you reset it, rather than
+quietly starting from zero.
 
-WhatsApp decides on bans mostly with server-side signals: how many people
-block or report you, how many chats you start with people who never wrote to
-you, and how repetitive your messages are. No client-side trick changes that,
-and this project deliberately contains no stealth or anti-detection code.
-Instead, `SafetyConfig` (on by default) keeps usage modest:
+A contact you message by name and by number counts as two people unless the
+client can match them up (it reads the chat header to do that). If you opt
+someone out by hand, do it for both.
 
-- **Rate limits**: conservative defaults above, including a daily cap.
-- **New-recipient cap** (`max_new_recipients_per_day`, default 10): a recipient
-  is "new" until they have sent you a message (seen in the chat history).
-  Unknown numbers and group participants count as new.
-- **Duplicate-broadcast guard** (`max_identical_recipients`, default 5): the
-  same content cannot go to more than this many distinct recipients per day.
-  Text is compared ignoring case and whitespace; for files the content is the
-  SHA-256 of the file plus the caption (captions are optional, files are always
-  compared). Only hashes are stored, never message text.
-- **Group cap** (`max_groups_per_day`, default 2): `create_group` goes through
-  the breaker, the rate limiter and the new-recipient accounting like any send.
-- **Opt-outs** (`opt_out_keywords`, default `stop`, `unsubscribe`): an incoming
-  message opts the sender out when, ignoring case, punctuation and emoji, it
-  equals a keyword or starts with one ("STOP.", "Stop!", "stop 🙏",
-  "stop sending me messages"; not "please stop" or "stopping"). It is checked
-  whenever a chat is read (`get_last_messages`, `wait_for_message`, and before
-  each send). Future sends raise `SafetyViolationError`. Manage manually with
-  `opt_out()`, `opt_in()` and `is_opted_out()`. Names and phone numbers are
-  different identities until linked: when `send_message_to_number` lands in a
-  chat, the header title is read and the number is linked to the saved name, so
-  an opt-out under either blocks both and counts are not doubled. If the
-  header cannot be read, the two identities stay separate; opt out under both.
-- **Circuit breaker** (`max_consecutive_failures`, default 3): an unexpected
-  logout, a ban or spam warning banner (also checked when opening any chat,
-  before dismissing the invalid-number dialog, and after each send), repeated
-  send failures, an unreadable state file, or a state file that cannot be
-  written halt all sends with `AccountAtRiskError` and a WARNING log, until you
-  call `reset_safety_breaker()`. A warning appearing after a successful send
-  trips the breaker without raising for that send. Banner detection uses
-  English text patterns (`ACCOUNT_RISK_TEXT_PATTERN`) that may need updating.
-- **Persistence**: counters, opt-outs, identity links, known senders and the
-  breaker state are stored as JSON in `<user_data_dir>/safety_state.json`
-  (override with `SafetyConfig(state_file=...)`). Writes are atomic (unique temp
-  file, fsync, rename) and happen under an advisory file lock (`fcntl.flock`,
-  skipped on platforms without it) as reload-merge-write, so two processes on
-  one profile do not lose each other's updates. The system fails closed: an
-  unreadable file is renamed to `safety_state.json.corrupt-<timestamp>` and the
-  breaker starts tripped (`unreadable safety state`); a failed save trips the
-  breaker in memory. Timestamps more than five minutes in the future are
-  dropped on load, and a backwards wall-clock jump cannot bypass the windows.
+## Tests
 
-Recommendations: message only people who expect it, honour every opt-out
-request, keep volume low and human-like, and warm up new numbers slowly.
-For bulk or business messaging use the official
-[WhatsApp Business Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api)
-instead of browser automation.
-
-## Running tests
-
-No browser or network is needed; Playwright is fully mocked.
+The tests mock Playwright, so they don't need a browser or a WhatsApp account:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest --cov=whatsapp_web --cov-branch --cov-report=term-missing
 ```
 
-Pytest, asyncio mode and coverage settings are in `pyproject.toml`.
+Coverage is at 100%, but that only proves the logic. The mocks don't know what
+the real page looks like, so after changing selectors, try it against your own
+"Message yourself" chat.
+
+## Not tried against the live site yet
+
+`send_message_to_number`, `wait_for_message`, `create_group` and `logout` pass
+their unit tests but haven't been run against real WhatsApp. Expect to adjust
+a selector or two. Also, documents you send come back from
+`get_last_messages` without a timestamp.
