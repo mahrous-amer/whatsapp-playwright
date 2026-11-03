@@ -63,6 +63,11 @@ What's there:
 - `create_group(name, participants)`
 - `logout()` and `close()`
 
+Chats are found by their exact name. If two chats have the same name (say a
+contact who shares your own name, next to your "Message yourself" chat), you
+get `AmbiguousContactError` and nothing is opened or sent. Rename one of them,
+or use `send_message_to_number`.
+
 One client drives one browser tab, so calls are queued behind a lock. If you
 `asyncio.gather` two sends, they run one after the other.
 
@@ -158,7 +163,7 @@ the real page looks like, so after changing selectors, try it against your own
 
 ## Not tried against the live site yet
 
-`send_message_to_number`, `wait_for_message`, `create_group` and `logout` pass
-their unit tests but haven't been run against real WhatsApp. Expect to adjust
-a selector or two. Also, documents you send come back from
-`get_last_messages` without a timestamp.
+`send_message_to_number`, `wait_for_message` and `create_group` pass their unit
+tests but haven't been run against real WhatsApp. Expect to adjust a selector
+or two. Also, documents you send come back from `get_last_messages` without a
+timestamp.
