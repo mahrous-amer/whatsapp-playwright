@@ -120,6 +120,13 @@ class ContactNotFoundError(WhatsAppError):
     """The contact or group could not be found in the chat search."""
 
 
+class AmbiguousContactError(ContactNotFoundError):
+    """More than one chat has exactly this name, so none is opened.
+
+    Rename one of the contacts, or use ``send_message_to_number``.
+    """
+
+
 class InvalidPhoneNumberError(WhatsAppError):
     """The phone number is malformed or WhatsApp reported it as invalid."""
 
@@ -1995,9 +2002,25 @@ class WhatsAppWeb:
         chat_result = await self._try_find_first(result_selectors, self._config.short_timeout_ms)
         if chat_result is None:
             raise ContactNotFoundError(f"No chat found for {contact_name!r}")
+        matching_chats = await self._count_matching_chats(result_selectors)
+        if matching_chats > 1:
+            await search_box.fill("")
+            raise AmbiguousContactError(
+                f"{matching_chats} chats are named {contact_name!r}; refusing to guess. "
+                "Rename one of them or use send_message_to_number()"
+            )
         await chat_result.click()
         # Leave the chat list unfiltered for later get_unread_chats() calls.
         await search_box.fill("")
+
+    async def _count_matching_chats(self, result_selectors: Sequence[str]) -> int:
+        """Count chat rows for the first result selector that matches any."""
+        page = self._require_page()
+        for selector in result_selectors:
+            matches = await page.locator(selector).count()
+            if matches:
+                return matches
+        return 0
 
     async def _open_chat_by_number(self, normalized_number: str) -> None:
         """Navigate to the click-to-chat URL and wait for it to resolve."""

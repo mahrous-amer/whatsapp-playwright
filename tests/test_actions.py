@@ -15,6 +15,7 @@ from whatsapp_web import (
     AccountAtRiskError,
     AttachmentError,
     ChatMessage,
+    AmbiguousContactError,
     ContactNotFoundError,
     ElementNotFoundError,
     GroupCreationError,
@@ -527,3 +528,25 @@ class TestFindFirstFallbacks:
 
     async def test_wait_for_state_returns_none_on_timeout(self, env):
         assert await env.wa._wait_for_state({"x": ("nothing",)}, 0.01) is None
+
+
+class TestAmbiguousContactName:
+    async def test_two_chats_with_the_same_name_are_refused(self, env):
+        env.fake.registry[rendered("chat_result_templates", "Alice")].count = AsyncMock(return_value=2)
+        with pytest.raises(AmbiguousContactError, match="2 chats are named 'Alice'"):
+            await env.wa.send_message("Alice", "hi")
+        assert ("open", "Alice") not in env.fake.events
+        assert ("send",) not in env.fake.events
+        env.fake.registry["search_box"].fill.assert_awaited_with("")
+
+    async def test_ambiguity_is_a_contact_not_found_error_and_not_retried(self, env):
+        result = env.fake.registry[rendered("chat_result_templates", "Alice")]
+        result.count = AsyncMock(return_value=3)
+        with pytest.raises(ContactNotFoundError):
+            await env.wa.get_last_messages("Alice")
+        assert env.fake.registry["search_box"].click.await_count == 1
+
+    async def test_result_that_vanishes_before_counting_is_still_opened(self, env):
+        env.fake.registry[rendered("chat_result_templates", "Alice")].count = AsyncMock(return_value=0)
+        await env.wa.send_message("Alice", "hi")
+        assert ("open", "Alice") in env.fake.events
